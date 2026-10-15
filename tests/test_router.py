@@ -1,0 +1,218 @@
+import json
+
+import pytest
+
+from qgent_cli import router, subagents
+
+CODEX_CACHE = {"models": [
+    {"slug": "gpt-6.1-sol", "description": "Latest workhorse model for coding and everyday work.",
+     "visibility": "list", "priority": 1,
+     "supported_reasoning_levels": [{"effort": e} for e in
+                                    ("low", "medium", "high", "xhigh", "max", "ultra")]},
+    {"slug": "gpt-6-astra", "description": "Frontier intelligence for the most demanding work.",
+     "visibility": "list", "priority": 2,
+     "supported_reasoning_levels": [{"effort": e} for e in ("low", "medium", "high", "xhigh")]},
+    {"slug": "gpt-6-luna", "description": "Fast and affordable model for easier tasks.",
+     "visibility": "list", "priority": 4,
+     "supported_reasoning_levels": [{"effort": e} for e in ("low", "medium", "high")]},
+    {"slug": "gpt-5.6-sol", "description": "Older generation workhorse model.",
+     "visibility": "list", "priority": 5, "supported_reasoning_levels": []},
+    {"slug": "secret", "description": "hidden", "visibility": "hide", "priority": 0},
+]}
+
+
+@pytest.fixture
+def codex_home(tmp_path, monkeypatch):
+    (tmp_path / "models_cache.json").write_text(json.dumps(CODEX_CACHE), encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    return tmp_path
+
+
+def test_codex_catalog_tiers(codex_home):
+    cat = router.codex_catalog()
+    assert [e["id"] for e in cat] == ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna"]
+    assert {e["id"]: e["tier"] for e in cat} == {
+        "gpt-6.1-sol": "strong", "gpt-6-astra": "frontier", "gpt-6-luna": "fast"}
+
+
+def test_codex_catalog_missing_cache_uses_user_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    assert [e["id"] for e in router.codex_catalog("my-model")] == ["my-model"]
+
+
+@pytest.mark.parametrize("prompt,task,low,high", [
+    ("what CRS is sites.geojson?", "inspection", 1, 1),
+    ("hello there", "conversation", 1, 1),
+    ("buffer the wells by 250 m", "analysis", 2, 2),
+    ("Build an A3 flood hazard vicinity map with legend and scale bar, then export "
+     "it to PDF and also save a template", "cartography", 4, 5),
+    ("reproject every shapefile in this folder to EPSG:32651", "batch", 3, 5),
+])
+def test_classify(prompt, task, low, high):
+    got_task, complexity = router.classify(prompt)
+    assert got_task == task
+    assert low <= complexity <= high
+
+
+def test_destructive_requests_get_a_capable_model(codex_home, monkeypatch):
+    assert router.classify("Delete the file sites_utm.gpkg")[1] >= 2
+    assert router.classify("Can you delete sites.gpkg?")[1] >= 2
+    assert router.classify("Delete sites.gpkg?")[1] >= 2
+    assert router.classify("please overwrite roads.shp")[1] >= 2
+    assert router.classify("what does delete do?")[1] == 1
+
+    def cheap(*_a, **_k):  # the AI router under-sizes it
+        return {"task": "question", "complexity": 1, "supervisor_model": "gpt-6-luna",
+                "supervisor_effort": "low", "scout_model": "gpt-6-luna",
+                "executor_model": "gpt-6-luna", "verifier_model": "gpt-6-luna",
+                "delegate": False, "reason": "trivial"}
+    monkeypatch.setattr(router, "_run_codex_router", cheap)
+    decision = _router("ai").decide("Delete sites_utm.gpkg with os.remove", "codex", "codex")
+    assert decision["complexity"] == 2
+    assert decision["roles"]["supervisor"]["model"] == "gpt-6.1-sol"
+    assert "changes data" in decision["reason"]
+
+
+@pytest.mark.parametrize("prompt", [
+    "list the empty layers and delete them",
+    "show the duplicates then remove them",
+    "Is sites.gpkg needed? If not, delete it",
+    "Can you delete sites.gpkg?",
+    "Delete sites.gpkg?",
+])
+def test_floor_holds_for_every_phrasing(codex_home, prompt):
+    decision = _router("heuristic").decide(prompt, "codex", "codex")
+    assert decision["complexity"] >= 2, prompt
+    assert decision["roles"]["supervisor"]["model"] != "gpt-6-luna", prompt
+    claude = _router("heuristic").decide(prompt, "claude", "claude")
+    assert claude["roles"]["supervisor"]["model"] != "haiku", prompt
+
+
+def test_follow_up_that_deletes_is_raised(codex_home):
+    sticky = _router("heuristic")
+    first = sticky.decide("what layers are loaded?", "codex", "codex")
+    assert first["roles"]["supervisor"]["model"] == "gpt-6-luna"
+    again = sticky.decide("yes, delete it", "codex", "codex")
+    assert again["source"] == "follow-up"
+    assert again["roles"]["supervisor"]["model"] != "gpt-6-luna"
+    assert router.classify("how do I delete a field?")[1] == 1  # a how-to stays cheap
+
+
+def test_clamp_effort():
+    entry = {"efforts": ["low", "medium", "high"]}
+    assert router.clamp_effort(entry, "xhigh") == "high"
+    assert router.clamp_effort(entry, "low") == "low"
+    assert router.clamp_effort({"efforts": ["low", "xhigh", "max"]}, "max", cap="high") == "low"
+    assert router.clamp_effort(entry, "bogus") == "medium"
+
+
+def test_heuristic_ladders(codex_home):
+    cat = router.codex_catalog()
+    easy = router.heuristic_decision("what layers are loaded?", "codex", cat)
+    assert easy["roles"]["supervisor"] == {"model": "gpt-6-luna", "effort": "low"}
+    hard = router.heuristic_decision(
+        "Delineate the watershed from the DEM, compute flow accumulation, then clip "
+        "the land cover and finally build an A3 map layout with a legend", "codex", cat)
+    assert hard["complexity"] == 5
+    assert hard["roles"]["supervisor"] == {"model": "gpt-6-astra", "effort": "high"}
+    assert hard["delegate"] is False  # codex is single-agent
+
+
+def test_claude_roles():
+    cat = router.claude_catalog()
+    decision = router.heuristic_decision(
+        "Build an A3 flood hazard map layout with legend, then export to PDF and "
+        "then save it as a template", "claude", cat)
+    roles = decision["roles"]
+    assert roles["scout"]["model"] == "haiku"
+    assert roles["supervisor"]["model"] in ("opus", "sonnet")
+    assert decision["delegate"] is (decision["complexity"] >= 4)
+
+
+def _router(mode="auto", **extra):
+    return router.Router(dict({"router": mode, "models": {}, "effort": ""}, **extra))
+
+
+def test_trivial_prompt_skips_ai(codex_home, monkeypatch):
+    def boom(*_a, **_k):
+        raise AssertionError("AI router must not run for trivial prompts")
+    monkeypatch.setattr(router, "_run_codex_router", boom)
+    decision = _router().decide("list the layers", "codex", "codex")
+    assert decision["source"] == "heuristic" and decision["complexity"] == 1
+
+
+def test_ai_route_is_validated(codex_home, monkeypatch):
+    calls = []
+
+    def fake(exe, model, text, schema, timeout):
+        calls.append((model, schema))
+        return {"task": "analysis", "complexity": 4, "supervisor_model": "gpt-6-astra",
+                "supervisor_effort": "max", "scout_model": "nope",
+                "executor_model": "gpt-6.1-sol", "verifier_model": "gpt-6-luna",
+                "delegate": True, "reason": "multi-step"}
+    monkeypatch.setattr(router, "_run_codex_router", fake)
+    decision = _router().decide("buffer wells, clip with the barangay layer and "
+                                "export a GeoPackage", "codex", "codex")
+    assert calls[0][0] == "gpt-6-luna"           # cheapest model routes
+    assert "gpt-6-astra" in calls[0][1]["properties"]["supervisor_model"]["enum"]
+    assert decision["source"] == "ai"
+    assert decision["roles"]["supervisor"] == {"model": "gpt-6-astra", "effort": "xhigh"}
+    assert decision["roles"]["scout"]["model"]   # invalid id replaced by heuristic
+    assert decision["delegate"] is False          # never on codex
+
+
+def test_ai_failure_falls_back(codex_home, monkeypatch):
+    def fail(*_a, **_k):
+        raise ValueError("no json")
+    monkeypatch.setattr(router, "_run_codex_router", fail)
+    decision = _router("ai").decide("hello", "codex", "codex")
+    assert decision["source"] == "heuristic" and "unavailable" in decision["reason"]
+
+
+def test_pins_and_off_and_follow_up(codex_home):
+    pinned = _router("heuristic", models={"codex": "gpt-6-luna"}, effort="high")
+    decision = pinned.decide("buffer the wells by 250 m", "codex", "codex")
+    assert decision["roles"]["supervisor"] == {"model": "gpt-6-luna", "effort": "high"}
+    assert decision["pinned"] == ["model", "effort"]
+    off = _router("off").decide("anything", "codex", "codex")
+    assert off["roles"]["supervisor"] == {"model": "", "effort": ""}
+    sticky = _router("heuristic")
+    first = sticky.decide("Build an A3 flood map layout with legend then export PDF",
+                          "codex", "codex")
+    again = sticky.decide("yes, do it", "codex", "codex")
+    assert again["source"] == "follow-up"
+    assert again["roles"]["supervisor"] == first["roles"]["supervisor"]
+    other = sticky.decide("yes", "claude", "claude")
+    assert other["source"] != "follow-up"
+
+
+def test_router_prompt_and_schema(codex_home):
+    cat = router.codex_catalog()
+    text = router.build_router_prompt("map it", "codex", cat, "xhigh", "layers: 2")
+    assert "gpt-6-astra — frontier" in text and "single-agent" in text
+    assert "Session context: layers: 2" in text
+    schema = router._schema([e["id"] for e in cat], ["low", "medium"])
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == set(schema["properties"])
+
+
+def test_guidance():
+    decision = {"task": "analysis", "complexity": 4, "delegate": True, "source": "ai",
+                "roles": {"supervisor": {"model": "opus", "effort": "medium"}}}
+    assert "qa-verifier PASS" in router.guidance(decision, "claude")
+    assert "self-verification" in router.guidance(decision, "codex")
+    assert router.guidance({"source": "off"}, "codex") == ""
+
+
+def test_subagent_definitions_follow_roles():
+    decision = {"roles": {"scout": {"model": "haiku"}, "executor": {"model": "opus"},
+                          "verifier": {"model": "sonnet"}}}
+    defs = subagents.definitions(decision)
+    assert set(defs) == {"data-scout", "geoprocessor", "cartographer", "qa-verifier"}
+    assert defs["data-scout"]["model"] == "haiku"
+    assert defs["geoprocessor"]["model"] == "opus"
+    assert defs["qa-verifier"]["model"] == "sonnet"
+    assert "mcp__qgis__inspect_dataset" in defs["data-scout"]["tools"]
+    assert defs["geoprocessor"]["prompt"].startswith("You are **geoprocessor**")
+    default = subagents.definitions()
+    assert default["data-scout"]["model"] == "haiku"  # frontmatter fallback

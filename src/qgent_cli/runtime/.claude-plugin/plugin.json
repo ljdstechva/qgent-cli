@@ -1,0 +1,6 @@
+{
+  "name": "qgent",
+  "version": "0.2.0",
+  "description": "QGent CLI runtime: QGIS skills and specialist subagents (data-scout, geoprocessor, cartographer, qa-verifier).",
+  "author": {"name": "QGent"}
+}
