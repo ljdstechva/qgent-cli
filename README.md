@@ -72,8 +72,18 @@ The roles are:
     team scout haiku · executor sonnet · verifier opus   delegate
 ```
 
-Trivial prompts ("what CRS is this?") are settled by keyword rules with no
-model call. A short follow-up such as "yes, do it" keeps the previous route.
+Plain read-only questions ("what CRS is this?") are settled by keyword rules
+with no model call. A short follow-up such as "yes, do it" keeps the previous
+route.
+
+**The fast tier never supervises.** The cheapest model (Codex's fast model,
+Claude `haiku`) only does the routing call and, on Claude, the read-only
+scout and verifier subagents. The main agent always gets at least
+`gpt-6.1-sol`-class (Codex) or `sonnet` (Claude), at low effort for simple
+turns. Text can't reliably say whether a request will change data ("nuke
+it", "yes", "what are the empty layers delete them"), so this floor holds for
+every prompt. It is cheaper than a wrong answer about your project. Pin a model
+with `/model` if you want to override it.
 
 Codex models come from Codex's own model list (`~/.codex/models_cache.json`),
 so new models are used as soon as Codex knows about them. The routing call

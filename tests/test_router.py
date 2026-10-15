@@ -79,6 +79,41 @@ def test_destructive_requests_get_a_capable_model(codex_home, monkeypatch):
     "Is sites.gpkg needed? If not, delete it",
     "Can you delete sites.gpkg?",
     "Delete sites.gpkg?",
+    # second fresh-verifier counterexamples
+    "Can you go ahead with dropping the empty fields?",
+    "Moving rivers.shp into the archive folder please",
+    "wiping the attribute table is fine",
+    "What layers are empty? Delete those.",
+    "How about you delete the temp layers now",
+    "Explain the plan, then delete sites.gpkg",
+    "Tell me about the layers and remove the empty ones",
+    "purge the scratch layers",
+    "modify the POP field values to be integers",
+    "the empty fields need dropping",
+    "moved files: put rivers.shp in archive",
+    "What's in sites.gpkg? Remove anything older than 2020.",
+    "clear all features from the roads layer",
+    "destroy the backup folder",
+    "do a clean-up of the scratch layers",
+    "over-write sites.gpkg with the clipped version",
+    # third fresh-verifier counterexamples (synonyms no keyword list names)
+    "nuke the roads layer", "get rid of the null geometries", "set NAME to null for all rows",
+    "show me the nulls then fill them with 0", "strip the Z values from the lines",
+    "trim the attribute table to 3 fields", "prune the duplicate vertices",
+    "dedupe the wells layer", "archive the old layers", "throw away the scratch layers",
+    "blank out the OWNER column", "write the changes back to the database",
+    "fill the nulls in POP with 0", "change the values in CLASS from A to B",
+    "fix the invalid geometries in place", "toss the duplicates", "ditch the old columns",
+    "scrap layer x", "trash the temp files", "kill the empty fields",
+    "set all ELEV values below 0 to 0", "assign CLASS = 3 to the selected features",
+    "swap the X and Y columns", "null out the bad readings", "zero out the negative values",
+    "remvoe the duplicates", "pls nuke it", "rm parcels.shp", "del the layer",
+    "apply the changes to the layer", "flatten the hierarchy and dump the old groups",
+    "decimate the point cloud in place", "collapse duplicate rows",
+    "squash the attribute values to lowercase", "lowercase all names in NAME",
+    "geocode the addresses and write lat/lon into the table",
+    "what if you deleted the roads layer", "what about removing the temp layers",
+    "How bout dropping the old field",
 ])
 def test_floor_holds_for_every_phrasing(codex_home, prompt):
     decision = _router("heuristic").decide(prompt, "codex", "codex")
@@ -91,11 +126,91 @@ def test_floor_holds_for_every_phrasing(codex_home, prompt):
 def test_follow_up_that_deletes_is_raised(codex_home):
     sticky = _router("heuristic")
     first = sticky.decide("what layers are loaded?", "codex", "codex")
-    assert first["roles"]["supervisor"]["model"] == "gpt-6-luna"
+    assert first["complexity"] == 1  # cheap, read-only first turn
     again = sticky.decide("yes, delete it", "codex", "codex")
     assert again["source"] == "follow-up"
     assert again["roles"]["supervisor"]["model"] != "gpt-6-luna"
-    assert router.classify("how do I delete a field?")[1] == 1  # a how-to stays cheap
+    for reply in ("yes, dropping them is fine", "yep, moving it now", "yes purge them",
+                  "yes, get rid of them", "yes", "do it", "proceed", "option 2", "1",
+                  "ok, set them to null", "yes commit", "fine, archive them",
+                  "ok do it on roads"):
+        fresh = _router("heuristic")
+        fresh.decide("what layers are loaded?", "codex", "codex")
+        assert fresh.decide(reply, "codex", "codex")["roles"]["supervisor"]["model"] \
+            != "gpt-6-luna", reply
+    # Plain how-to / definition questions stay cheap.
+    for question in ("how do I delete a field?", "what does delete do?",
+                     "what happens if I remove a layer?"):
+        assert router.classify(question)[1] == 1, question
+
+
+@pytest.mark.parametrize("prompt", [
+    "what layers are loaded?", "list the layers", "what CRS is sites.geojson?",
+    "how many features are in roads?", "show the attribute table of parcels",
+    "which fields does parcels have?", "hello", "thanks!", "describe the project",
+    "how do I delete a field?", "what does the erase tool do?",
+])
+def test_read_only_questions_stay_cheap(codex_home, prompt):
+    decision = _router("heuristic").decide(prompt, "codex", "codex")
+    assert decision["complexity"] == 1, prompt
+    assert decision["roles"]["supervisor"] == {"model": "gpt-6.1-sol", "effort": "low"}, prompt
+
+
+@pytest.mark.parametrize("prompt", [
+    # fourth fresh-verifier round: question-shaped instructions
+    "what are the empty layers delete them", "which layers are empty nuke them",
+    "is the crs wrong if so set it to 32651", "how to delete roads.shp do it now",
+    "give me a new column named code", "who cares just do it",
+    "what are the empty layers\n\nDelete them.", "what are the empty layers — delete them",
+    "how 'bout you nuke the temp layer", "display the roads layer in red",
+    "what is the difference lol just delete roads", "why not just get rid of the empty layers?",
+])
+@pytest.mark.parametrize("backend,fast", [("codex", "gpt-6-luna"), ("claude", "haiku")])
+def test_supervisor_is_never_fast_tier(codex_home, monkeypatch, prompt, backend, fast):
+    def picks_fast(*_a, **_k):  # even if the AI router chooses the fast tier
+        return {"task": "question", "complexity": 2, "supervisor_model": fast,
+                "supervisor_effort": "low", "scout_model": fast, "executor_model": fast,
+                "verifier_model": fast, "delegate": False, "reason": "cheap"}
+    monkeypatch.setattr(router, "_run_codex_router", picks_fast)
+    monkeypatch.setattr(router, "_run_claude_router", picks_fast)
+    for mode in ("auto", "ai", "heuristic"):
+        decision = _router(mode).decide(prompt, backend, backend)
+        assert decision["roles"]["supervisor"]["model"] != fast, (mode, prompt)
+
+
+@pytest.mark.parametrize("raw", [[], "str", None, 5, {"complexity": "3"}])
+def test_bad_router_output_falls_back(codex_home, monkeypatch, raw):
+    monkeypatch.setattr(router, "_run_codex_router", lambda *_a, **_k: raw)
+    decision = _router("ai").decide("buffer the rivers", "codex", "codex")
+    assert decision["source"] == "heuristic"
+    monkeypatch.setattr(router, "_run_codex_router",
+                        lambda *_a, **_k: (_ for _ in ()).throw(AttributeError("x")))
+    assert _router("ai").decide("buffer the rivers", "codex", "codex")["source"] == "heuristic"
+
+
+def test_fast_only_current_generation_keeps_an_older_strong_model(tmp_path, monkeypatch):
+    cache = {"models": [
+        {"slug": "tiny", "description": "Fast model", "visibility": "list", "priority": 1},
+        {"slug": "old-strong", "description": "Older generation workhorse model.",
+         "visibility": "list", "priority": 5}]}
+    (tmp_path / "models_cache.json").write_text(json.dumps(cache), encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    decision = _router("heuristic").decide("what layers are loaded?", "codex", "codex")
+    assert decision["roles"]["supervisor"]["model"] == "old-strong"
+
+
+def test_auto_mode_sends_any_destructive_prompt_to_the_ai(codex_home, monkeypatch):
+    calls = []
+
+    def fake(*_a, **_k):
+        calls.append(1)
+        raise ValueError("offline")
+    monkeypatch.setattr(router, "_run_codex_router", fake)
+    _router("auto").decide("nuke the roads layer", "codex", "codex")
+    assert calls  # unrecognised instruction: the AI sizes it
+    calls.clear()
+    _router("auto").decide("how do I delete a field?", "codex", "codex")
+    assert not calls  # a plain how-to question is read-only
 
 
 def test_clamp_effort():
@@ -109,7 +224,7 @@ def test_clamp_effort():
 def test_heuristic_ladders(codex_home):
     cat = router.codex_catalog()
     easy = router.heuristic_decision("what layers are loaded?", "codex", cat)
-    assert easy["roles"]["supervisor"] == {"model": "gpt-6-luna", "effort": "low"}
+    assert easy["roles"]["supervisor"] == {"model": "gpt-6.1-sol", "effort": "low"}
     hard = router.heuristic_decision(
         "Delineate the watershed from the DEM, compute flow accumulation, then clip "
         "the land cover and finally build an A3 map layout with a legend", "codex", cat)

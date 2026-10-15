@@ -82,6 +82,9 @@ def codex_catalog(user_model=""):
             "efforts": efforts or ["low", "medium", "high"],
             "priority": model.get("priority", 99)})
     current = [e for e in entries if not e["older"]] or entries
+    if all(e["tier"] == "fast" for e in current):
+        # Keep a stronger older model so the supervisor floor has somewhere to go.
+        current += [e for e in entries if e["older"] and e["tier"] != "fast"][:1]
     current.sort(key=lambda e: e["priority"])
     if not current and user_model:
         current = [{"id": user_model, "label": "configured Codex model", "tier": "strong",
@@ -149,18 +152,52 @@ _HEAVY = (r"watershed|catchment|hydrolog|flood (model|hazard|map)|atlas|batch|"
           r"vicinity map|eia|ecc|compliance")
 # Requests that change or destroy data deserve a capable model even when
 # they are short: the cheapest tier tends to refuse or cut corners.
-_DESTRUCTIVE = re.compile(r"\b(delet\w*|remov\w*|overwrit\w*|eras\w*|drop|renam\w*|"
-                          r"move|replac\w*|truncat\w*|wipe|clean ?up|edit\w*|updat\w*)\b",
-                          re.I)
-# Questions *about* an operation ("what does delete do?", "how do I remove a
-# field?") — as opposed to requests to perform it, which may also start with
-# "list…", "show…" or "is…" ("list the empty layers and delete them").
-_INFO_QUESTION = re.compile(r"^\s*(what|why|how|explain|describe|tell me about|"
-                            r"what's|whats)\b", re.I)
+# Stems, so every verb form counts ("drop", "dropping", "dropped"). Matching
+# too much only costs a stronger model; matching too little risks the cheapest
+# model touching user data, so the list errs wide.
+_DESTRUCTIVE = re.compile(
+    r"\b(delet|remov|over-?writ|eras|drop|renam|mov(e|es|ed|ing)\b|replac|truncat|"
+    r"wip(e|es|ed|ing)\b|purg|clear|modif|destroy|clean[- ]?up|discard|edit|updat|"
+    r"reset|overrid|unlink|rmtree|empty (the|all|every))", re.I)
+# The fast tier is earned, not defaulted: only requests recognised as
+# read-only may use it. Everything else — any instruction, any multi-clause
+# request, a bare "yes" / "do it" / "1" — might change data, and keyword lists
+# can never name every way to say so ("nuke it", "get rid of", "set X to
+# null"). Unknown phrasings therefore cost a stronger model, never user data.
+_READ_ONLY_START = re.compile(
+    r"^\s*(what|which|how(?!\s+(about|bout)\b)|why|where|when|who|whose|is|are|was|"
+    r"were|does|did|list|show|describe|explain|tell me|count|summari[sz]e|inspect|"
+    r"preview|display|print|give me|find|search|look up|check)\b", re.I)
+# How-to / definition questions may mention an operation without asking for
+# it ("how do I delete a field?", "what does the erase tool do?").
+_HOW_TO = re.compile(r"^\s*(how (do|does|can|could|should|would) (i|we|you|one)\b|how to\b|"
+                     r"what (does|do|is|are)\b|what's\b|explain (what|how)\b|"
+                     r"what happens (if|when)\b|what is the difference)", re.I)
+# A second clause turns a question into a request: "What layers are empty?
+# Delete those.", "show the nulls then fill them", "... and remove them".
+# (A sentence break needs a space after it, so "sites.geojson" is one word.)
+_SECOND_CLAUSE = re.compile(r"[.?!;:]\s+\S|,\s*\S|\b(then|and|also|after that|next)\b", re.I)
+_SMALLTALK = re.compile(r"^\s*(hi|hello|hey|thanks|thank you|good (morning|afternoon|"
+                        r"evening)|bye|goodbye)\b[\s!.,]*(there|everyone|qgent|so much|"
+                        r"a lot)?[\s!.]*$", re.I)
+_SPECULATIVE = re.compile(r"^\s*what (if|about)\b", re.I)
+
+
+def is_read_only(prompt):
+    """True only for requests that plainly just ask for information."""
+    text = prompt.strip()
+    if _SMALLTALK.match(text):
+        return True
+    if not _READ_ONLY_START.match(text) or _SPECULATIVE.match(text):
+        return False
+    if _SECOND_CLAUSE.search(text.rstrip("?.! ")):
+        return False
+    return not _DESTRUCTIVE.search(text) or bool(_HOW_TO.match(text))
 
 
 def _changes_data(prompt):
-    return bool(_DESTRUCTIVE.search(prompt)) and not _INFO_QUESTION.match(prompt)
+    """Might the request change data? (Anything not plainly read-only.)"""
+    return not is_read_only(prompt)
 
 
 _QUESTION = re.compile(r"^\s*(what|which|how many|how much|is|are|does|do|can|"
@@ -184,11 +221,10 @@ def classify(prompt):
     hits = {kind: len(re.findall(pattern, text)) for kind, pattern in _KEYWORDS.items()}
     kinds = [kind for kind, count in hits.items() if count]
     question = bool(_QUESTION.match(prompt)) or text.rstrip().endswith("?")
-    if _changes_data(prompt):
-        if not kinds:
-            return "data", 2
-        if "data" not in kinds:
-            kinds.append("data")
+    # Unrecognised instructions are at least 2; _destructive_floor guarantees
+    # the same for every route, so the keyword score is not inflated here.
+    if not kinds and _changes_data(prompt):
+        return "data", 2
     if not kinds:
         task = "question" if question else "conversation"
         return task, 2 if words > 40 or text.startswith(("why", "explain")) else 1
@@ -219,8 +255,10 @@ def classify(prompt):
 
 def _assignments(backend, cat, complexity, cap):
     """Role -> (model entry, effort) ladders for a complexity level."""
+    # The supervisor never runs on the fast tier (see SUPERVISOR_FLOOR).
     if backend == "claude":
-        sup_tier = {1: "fast", 2: "balanced", 3: "balanced", 4: "strong", 5: "strong"}[complexity]
+        sup_tier = {1: "balanced", 2: "balanced", 3: "balanced", 4: "strong",
+                    5: "strong"}[complexity]
         sup_effort = {1: "low", 2: "low", 3: "medium", 4: "medium", 5: "high"}[complexity]
         roles = {
             "supervisor": (sup_tier, sup_effort),
@@ -230,7 +268,8 @@ def _assignments(backend, cat, complexity, cap):
             "verifier": ("balanced" if complexity >= 4 else "fast", "medium"),
         }
     else:
-        sup_tier = {1: "fast", 2: "strong", 3: "strong", 4: "strong", 5: "frontier"}[complexity]
+        sup_tier = {1: "strong", 2: "strong", 3: "strong", 4: "strong",
+                    5: "frontier"}[complexity]
         sup_effort = {1: "low", 2: "low", 3: "medium", 4: "high", 5: "high"}[complexity]
         roles = {role: (sup_tier, sup_effort) for role in ROLES}
     out = {}
@@ -241,8 +280,33 @@ def _assignments(backend, cat, complexity, cap):
     return out
 
 
+def _supervisor_floor(backend, cat, cap, decision):
+    """SUPERVISOR_FLOOR: the main agent never runs on the fast tier.
+
+    Whether a request only reads or changes data cannot be decided reliably
+    from free text ("nuke it", "yes", "what are the empty layers delete
+    them"), so the cheapest model is kept to routing and, on Claude, the
+    scout/verifier subagents. The supervisor always gets at least the strong
+    (Codex) / balanced (Claude) tier; the router still chooses effort and when
+    to go higher.
+    """
+    tiers = {e["id"]: e["tier"] for e in cat}
+    supervisor = decision["roles"]["supervisor"]
+    if tiers.get(supervisor["model"], "strong") != "fast":
+        return decision
+    floor = _assignments(backend, cat, max(1, decision["complexity"]), cap)["supervisor"]
+    floor = dict(floor, effort=supervisor.get("effort") or floor["effort"])
+    entry = next((e for e in cat if e["id"] == floor["model"]), None)
+    floor["effort"] = clamp_effort(entry, floor["effort"], cap)
+    decision = dict(decision, roles=dict(decision["roles"], supervisor=floor))
+    if backend == "codex":  # single agent: every role is the supervisor
+        decision["roles"] = {role: dict(floor) for role in ROLES}
+    return decision
+
+
 def _destructive_floor(prompt, backend, cat, cap, decision):
     """Data-changing requests get at least complexity 2 and no fast-tier supervisor."""
+    decision = _supervisor_floor(backend, cat, cap, decision)
     if not _changes_data(prompt):
         return decision
     tiers = {e["id"]: e["tier"] for e in cat}
@@ -282,8 +346,9 @@ Complexity rubric:
 5 = hard: long pipelines, hydrology/terrain modelling, batch processing of many
     files, compliance deliverables (EIA/DENR vicinity + hazard maps), or anything
     needing careful method choice and verification.
-Requests that delete, overwrite or edit data are at least 2 and never get a
-fast-tier supervisor.
+The supervisor is never a fast-tier model (fast tier is for scout/verifier
+only). Anything that could change data (delete, overwrite, edit, fill, set
+values, save over, ...) is at least 2.
 
 Roles: supervisor (plans, talks, reports, does the work on single-agent backends);
 scout (read-only data inspection); executor (runs analysis/cartography);
@@ -371,6 +436,8 @@ def _run_codex_router(exe, model, text, schema, timeout):
 
 
 def _validate(raw, backend, cat, cap, fallback):
+    if not isinstance(raw, dict):
+        raise ValueError(f"router returned {type(raw).__name__}, not an object")
     ids = {e["id"]: e for e in cat}
     complexity = raw.get("complexity")
     if not isinstance(complexity, int) or not 1 <= complexity <= 5:
@@ -424,7 +491,10 @@ class Router:
             decision = _destructive_floor(prompt, backend, cat, cap, decision)
             return self._finish(decision, pins, backend)
         decision = heuristic_decision(prompt, backend, cat, cap)
-        trivial = decision["complexity"] <= 1 and len(prompt.split()) <= 25
+        # Only plainly read-only prompts skip the AI router; everything else is
+        # sized by it (and floored below whatever it says).
+        trivial = (decision["complexity"] <= 1 and len(prompt.split()) <= 25
+                   and is_read_only(prompt))
         if mode == "ai" or (mode == "auto" and not trivial):
             model = _router_model(backend, cat, self.cfg)
             if on_status:
@@ -438,8 +508,8 @@ class Router:
                     self.cfg.get("router_timeout") or 45))
                 decision = _validate(raw, backend, cat, cap, decision)
                 decision["router_model"] = model
-            except (OSError, ValueError, RuntimeError, KeyError, TypeError,
-                    subprocess.TimeoutExpired) as exc:
+            except Exception as exc:
+                # to the heuristic decision; routing must never break a turn.
                 decision["reason"] += f" (AI router unavailable: {type(exc).__name__})"
         # The floor binds every route — heuristic, AI or fallback.
         decision = _destructive_floor(prompt, backend, cat, cap, decision)
